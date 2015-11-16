@@ -1,0 +1,227 @@
+---
+title: "Customer Modeling and Prospecting"
+author: "Nathaniel Reed"
+date: "October 21, 2015"
+output: pdf_document
+---
+
+## Introduction
+
+In this case study, we simulate customer accounts in Salesforce for a set of existing customers and build a linear regression model that could be used for prospecting.
+
+Our fictitious company is a software company that sells a POS (point-of-sale) tax solution for the apparel industry. We're interested in understanding which of our existing customers are "best". Further, we would like to use the model of our best customers to predict sales to new customers.
+
+We will use multi-variable linear regression to come up with this predictive model.
+
+# Variables?
+First, what constitutes a "good customer"? Although there are many ways to measure that, we are primarily concerned with Deal Size and Days to Close.
+
+Our working hypothesis is that deal size and days to close are influenced strongly by the following independent variables:
+
+* Sales Volume (revenue)
+* Employee Count
+
+# Obtain data
+
+The data was obtained by quering a database of firmographics related data, which was then written to a CSV file (companies.csv):
+
+```{r, message=FALSE}
+require(RMySQL)
+mydb = dbConnect(MySQL(), user='miheir', password='description', dbname='master', host='cluster1.cluster-cfsgw1vrge5p.us-west-2.rds.amazonaws.com')
+rs = dbSendQuery(mydb, "SELECT `Duns Number` as duns_number,
+                               `Business Name` as business_name,
+                               `Physical City` as physical_city,
+                               `Physical State Abbreviation` as physical_state_abbr,
+                               `Emp Total` as emp_total,
+                               `Sales Volume US` as sales_volume,
+                               `Primary SIC 8 Digit` as primary_sic_8,
+                               `Primary SIC 8 Digit Description` as primary_sic_desc,
+                               `Viability Score` as viability_score,
+                               `NAICS 6 Digit Description` as naics_6_desc,
+                               `NAICS 6 Digit Code` as naics_6,
+                               `Market Segmentation Cluster` as market_segmentation_cluster
+FROM master.textgen_data
+WHERE `Primary SIC 8 Digit` like '56%'
+  AND `Sales Volume US` <= 500000000;");
+
+data = fetch(rs, n=-1)
+write.csv(data, file="/Users/reedn/DataChallenge/companies.csv")
+```
+
+Here we load the data, converting to the appropriate data types for analysis:
+
+```{r}
+data = read.table(file="/Users/reedn/DataChallenge/companies.csv", 
+                  col.names = c("row_id", "duns", "business_name", "physical_city",
+                                "physical_state_abbr", "emp_total", "sales_volume", "primary_sic",
+                                "primary_sic_desc", "viability_score", "naics_desc", "naics", 
+                                "market_segmentation_cluster"),
+                  colClasses=c("character",        # row id
+                               "character",        # Duns
+                               "character",        # Business Name
+                               "character",        # Physical City
+                               "factor",           # State
+                               "numeric",          # Emp Total 
+                               "numeric",          # Sales Volume
+                               "factor",           # Primary Sic
+                               "character",        # Primary Sic Description
+                               "factor",           # Viability Score
+                               "character",        # NAICS DESC
+                               "factor",           # NAICS
+                               "factor"           # marketing segmentation cluster
+                               ), 
+                  skip=2, quote="\"'", sep=",")
+```
+
+We will simulate accounts by generating Deal Size and Days to Close based on variables such as sales_volume:
+
+```{r, message=FALSE}
+library(dplyr)
+n <- 1 : nrow(data);
+mn_sales <- mean(data$sales_volume)
+epsilon <- mn_sales / nrow(data) * 1000
+accounts <- data %>%
+mutate(expected_deal_size = sales_volume * .20, 
+        noise = runif(length(sales_volume),                           
+                     -epsilon, 
+                     epsilon),
+        deal_size = ifelse(expected_deal_size + noise < 0,
+                           0,
+                           expected_deal_size + noise))
+
+# Days to close
+accounts <- mutate(accounts, days_to_close = (sales_volume >= 18225000) * 90 + (sales_volume <= 18225000 & sales_volume >= 700000) * 60 + (sales_volume >= 110000 & sales_volume <= 700000) * 30 + (sales_volume <= 110000) * 20 + runif(length(sales_volume), -15, 15))
+ 
+
+```
+
+For the analysis, we will select only the variables we're interested in:
+
+```{r, message=FALSE}
+accounts <- select(accounts, days_to_close, deal_size, emp_total, sales_volume, physical_state_abbr)
+```
+
+Here's what our data looks like:
+
+```{r}
+summary(accounts)
+```
+
+## Independent Variables
+
+We're interested in understanding relationships among our dependent and independent variables. Scatterplot matrixes can help show these relationships.
+
+Because there are over 100 states and provinces in this data set, it is helpful to create a smaller number of bins to visualize the correlations. Here we see the top 10 states / provinces in sales volume:
+
+```{r, echo=TRUE}
+by_state_abbr <- group_by(accounts, physical_state_abbr)
+by_state_summary <- by_state_abbr %>% summarize(total_sales_volume = sum(sales_volume)) %>% arrange(desc(total_sales_volume))
+by_state_summary[1:10,]$physical_state_abbr
+```
+
+Our top 3 states in terms of sales volume are California, New York and Ohio (no surprises, as those are very populous states).
+
+```{r, echo=TRUE}
+accounts <- accounts %>% 
+  mutate(state_bin = as.factor(ifelse(physical_state_abbr == 'CA', 'CA', ifelse(physical_state_abbr == 'NY', 'NY', ifelse(physical_state_abbr == 'OH', 'OH', 'Other')))))
+```
+
+We can look at the scatterplots of the various variables:
+
+```{r, echo=TRUE}
+pairs(~ deal_size + days_to_close + emp_total + sales_volume + state_bin, data=accounts)
+```
+
+# Collinearity 
+
+We see that there is a strong correlation between sales volume and employee total: 
+```{r, echo=TRUE}
+plot(accounts$sales_volume, accounts$emp_total)
+abline(lm(accounts$emp_total~accounts$sales_volume), col="red")
+```
+
+We can throw out one of these variables when we perform a regression analysis. 
+
+# Perform Linear Regression
+
+Let's use sales_volume as a predictor of deal size:
+
+```{r, echo=TRUE, message=FALSE}
+fit <- lm(data=accounts, deal_size ~ sales_volume)
+summary(fit)
+```
+
+The model shows a slope of approximately 0.68 with a p-value < 0.05, suggesting a significant linear relationship between deal size and sales_volume.
+
+# Plot prediction interval with linear regression line
+
+```{r, echo=FALSE, message=FALSE}
+require(ggplot2)
+d = data.frame(accounts, predict(fit, interval="prediction"))
+p3 = ggplot(d, aes(x=sales_volume, y=deal_size)) + geom_ribbon(aes(ymin=lwr,ymax=upr,fill='prediction'),alpha=0.3) + geom_smooth(method="lm",aes(fill='confidence'),alpha=0.3) +     geom_smooth(method="lm",se=FALSE,color='blue') +
+     geom_point() +
+     scale_fill_manual('Interval', values = c('green', 'yellow')) + ylab('Deal Size ($)') + xlab('Sales Volume ($)')
+p3
+```
+
+# Residuals and Model Diagnostics
+
+```{r, echo=FALSE, message=FALSE}
+require(gridExtra)
+m <- fit
+r <- residuals(m)
+yh <- predict(m)
+scatterplot <- function(x,y, title="", xlab="", ylab="") {
+  d <- data.frame(x=x,y=y)
+	p <- ggplot(d, aes(x=x,y=y)) + geom_point() + xlab(xlab) + ylab(ylab) + labs(title=title)
+	return(p)
+}
+
+p1 <- scatterplot(yh,r,
+                  title="Residuals vs Fitted",
+                  xlab="Fitted values",
+                  ylab="Residuals")
+p1 <- p1 +geom_hline(yintercept=0)+geom_smooth()
+
+s <- sqrt(deviance(m)/df.residual(m))
+rs <- r/s
+
+qqplot <- function(y,
+                   distribution=qnorm,
+                   title="Normal Q-Q",
+                   xlab="Theretical Quantiles",
+                   ylab="Sample Quantiles") {
+    require(ggplot2)
+    x <- distribution(ppoints(y))
+    d <- data.frame(x=x, y=sort(y))
+    p <- ggplot(d, aes(x=x, y=y)) +
+        geom_point() +
+            geom_line(aes(x=x, y=x)) +
+                labs(title=title) +
+                    xlab(xlab) +
+                        ylab(ylab)
+    return(p)
+}
+
+p2 <- qqplot(rs, ylab="Standardized residuals")
+
+sqrt.rs <- sqrt(abs(rs))
+p3 <- scatterplot(yh,sqrt.rs,
+                  title="Scale-Location",
+                  xlab="Fitted values",
+                  ylab=expression(sqrt("Standardized residuals")))
+p3 <- p3 + geom_smooth()
+
+hii <- lm.influence(m, do.coef = FALSE)$hat
+p4 <- scatterplot(hii,rs)
+p4 <- p4+
+    geom_hline(yintercept=0)+
+    geom_smooth() +
+    geom_text(aes(x=min(hii)+diff(range(hii))*0.3,
+                  y=min(rs)+diff(range(rs))*0.04,
+                  label="--   Cook's distance", size=3))+
+    theme(legend.position="none")
+    
+grid.arrange(p1,p2,p3,p4, ncol=2)
+```
+
